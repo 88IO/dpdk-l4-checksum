@@ -16,7 +16,7 @@
 #define BURST_SIZE 32
 
 #define COUNT_MAX 10000000
-#define NUM_DIFF_32 6
+#define NUM_DIFF_32 4
 
 uint64_t total_packets = 0;
 uint64_t total_time = 0;
@@ -31,6 +31,7 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 	uint16_t q;
 	struct rte_eth_dev_info dev_info;
 	struct rte_eth_txconf txconf;
+	#ifdef L4CSUM_OFFLOAD
 	struct rte_eth_conf port_conf = {
 		.txmode = {
 			.offloads =
@@ -39,6 +40,10 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 				RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE
 		}
 	};
+	#else
+	struct rte_eth_conf port_conf;
+	memset(&port_conf, 0, sizeof(struct rte_eth_conf));
+	#endif
 
 	if (!rte_eth_dev_is_valid_port(port))
 		return -1;
@@ -165,8 +170,8 @@ lcore_main(void)
 	struct rte_ipv4_hdr *ipv4h;
 	struct rte_tcp_hdr *tcph;
 	char *payload;
-	uint32_t l3_payload_len;
-	struct timespec start, end;
+	uint32_t l4_len;
+	struct timespec start_t, end_t;
 	long time;
 
 	printf("\nCore %u forwarding packets. [Ctrl+C to quit]\n",
@@ -191,14 +196,14 @@ lcore_main(void)
 			ipv4h = (struct rte_ipv4_hdr*)(eth + 1);
 			tcph = (struct rte_tcp_hdr*)((void*)ipv4h + (ipv4h->ihl << 2));
 			payload = (char*)((void*)tcph + (tcph->data_off << 2));
-			l3_payload_len = rte_be_to_cpu_16(ipv4h->total_length) - (ipv4h->ihl << 2);
+			l4_len = rte_be_to_cpu_16(ipv4h->total_length) - (ipv4h->ihl << 2);
 
 			// l4 checksum
 			tcph->cksum = 0;
 			#if defined(L4CSUM_DIFF) || defined(L4CSUM_OFFLOAD)
 			tcph->cksum = rte_ipv4_udptcp_cksum(ipv4h, tcph);
 			#endif
-			timespec_get(&start, TIME_UTC);
+			timespec_get(&start_t, TIME_UTC);
 			#ifdef L4CSUM_DIFF
 			uint32_t *pos = tcph;
 			uint32_t csum32 = ~tcph->cksum;
@@ -211,109 +216,129 @@ lcore_main(void)
 			#ifdef L4CSUM_OFFLOAD
 			uint32_t csum = csum32_add(
 				csum32_add(ipv4h->src_addr, ipv4h->dst_addr),
-				(ipv4h->next_proto_id << 24) + rte_cpu_to_be_16(l3_payload_len)
+				(ipv4h->next_proto_id << 24) + rte_cpu_to_be_16(l4_len)
 			);
 			tcph->cksum = csum32_add_fold(csum);
 			m->l2_len = sizeof(struct rte_ether_hdr);
 			m->l3_len = ipv4h->ihl << 2;
 			m->ol_flags |= (RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_TCP_CKSUM);
 			#endif
+			#ifdef RTE_DEFAULT
+			tcph->cksum = rte_ipv4_udptcp_cksum(ipv4h, tcph);
+			#endif
 			#ifdef ADD32AS64
 			uint32_t *pos = tcph;
-			uint64_t csum = csum32_add(
-				csum32_add(ipv4h->src_addr, ipv4h->dst_addr),
-				(ipv4h->next_proto_id << 24) + rte_cpu_to_be_16(l3_payload_len)
-			);
-			for (; l3_payload_len >= 4; l3_payload_len -= 4)
-				csum += *pos++;
-			if (l3_payload_len > 0)
-				csum += *pos & (0xFFFFFFFF >> (8 * l3_payload_len));
+			uint32_t *end = pos + l4_len / sizeof(uint32_t);
+			uint64_t csum = ipv4h->src_addr + ipv4h->dst_addr
+				+ (ipv4h->next_proto_id << 8) + rte_cpu_to_be_16(l4_len);
+			for (; pos != end; pos++)
+				csum += *pos;
+			if (l4_len % 4)
+				csum += *pos & (0xFFFFFFFF >> (8 * (l4_len % 4)));
 			tcph->cksum = ~csum32_add_fold(csum64_add_fold(csum));
+			#endif
+			#ifdef ADD16AS32
+			uint16_t *pos = tcph;
+			uint16_t *end = pos + l4_len / sizeof(uint16_t);
+			uint32_t csum = (ipv4h->src_addr >> 16) + (ipv4h->src_addr & 0xFFFF) 
+				+ (ipv4h->dst_addr >> 16) + (ipv4h->dst_addr & 0xFFFF) 
+				+ (ipv4h->next_proto_id << 8) + rte_cpu_to_be_16(l4_len);
+			for (; pos != end; pos++)
+				csum += *pos;
+			if (l4_len % 2)
+				csum += *pos & 0xFF;
+			tcph->cksum = ~csum32_add_fold(csum);
 			#endif
 			#ifdef ADD64
 			uint64_t *pos = (uint64_t*)tcph;
+			uint64_t *end = pos + l4_len / sizeof(uint64_t);
 			uint64_t csum = csum64_add(
 				*(uint64_t*)&ipv4h->src_addr,
-				(ipv4h->next_proto_id << 24) + rte_cpu_to_be_16(l3_payload_len)
+				(ipv4h->next_proto_id << 24) + rte_cpu_to_be_16(l4_len)
 			);
-			for (; l3_payload_len >= 8; l3_payload_len -= 8)
-				csum = csum64_add(csum, *pos++);
-			if (l3_payload_len > 0)
-				csum = csum64_add(csum, *pos & (0xFFFFFFFFFFFFFFFF >> (8 * l3_payload_len)));
+			for (; pos != end; pos++)
+				csum = csum64_add(csum, *pos);
+			if (l4_len % 8)
+				csum = csum64_add(csum, *pos & (0xFFFFFFFFFFFFFFFF >> (8 * (l4_len % 8))));
 			tcph->cksum = ~csum32_add_fold(csum64_add_fold(csum));
 			#endif
 			#ifdef ADD32
 			uint32_t *pos = tcph;
+			uint32_t *end = pos + l4_len / sizeof(uint32_t);
 			uint32_t csum = csum32_add(
 				csum32_add(ipv4h->src_addr, ipv4h->dst_addr),
-				(ipv4h->next_proto_id << 24) + rte_cpu_to_be_16(l3_payload_len)
+				(ipv4h->next_proto_id << 24) + rte_cpu_to_be_16(l4_len)
 			);
-			for (; l3_payload_len >= 4; l3_payload_len -= 4)
-				csum = csum32_add(csum, *pos++);
-			if (l3_payload_len > 0)
-				csum = csum32_add(csum, *pos & (0xFFFFFFFF >> (8 * l3_payload_len)));
+			for (; pos != end; pos++)
+				csum = csum32_add(csum, *pos);
+			if (l4_len % 4)
+				csum = csum32_add(csum, *pos & (0xFFFFFFFF >> (8 * (l4_len % 4))));
 			tcph->cksum = ~csum32_add_fold(csum);
 			#endif
 			#ifdef ADD16
 			uint16_t *pos = tcph;
+			uint16_t *end = pos + l4_len / sizeof(uint16_t);
 			uint16_t csum = csum16_add(
 				csum16_add(ipv4h->src_addr >> 16, ipv4h->src_addr & 0xFFFF),
 				csum16_add(ipv4h->dst_addr >> 16, ipv4h->dst_addr & 0xFFFF)
 			);
 			csum = csum16_add(
 				csum,
-				csum16_add(ipv4h->next_proto_id << 8, rte_cpu_to_be_16(l3_payload_len))
+				csum16_add(ipv4h->next_proto_id << 8, rte_cpu_to_be_16(l4_len))
 			);
-			for (; l3_payload_len >= 2; l3_payload_len -= 2)
-				csum = csum16_add(csum, *pos++);
-			if (l3_payload_len > 0)
+			for (; pos != end; pos++)
+				csum = csum16_add(csum, *pos);
+			if (l4_len % 2)
 				csum = csum16_add(csum, *pos & 0xFF);
 			tcph->cksum = ~csum;
 			#endif	
 			#ifdef SUB64
 			uint64_t *pos = tcph;
+			uint64_t *end = pos + l4_len / sizeof(uint64_t);
 			uint64_t csum = csum64_sub(
-				(ipv4h->next_proto_id << 24) + rte_cpu_to_be_16(l3_payload_len),
+				(ipv4h->next_proto_id << 24) + rte_cpu_to_be_16(l4_len),
 				~*(uint64_t*)&ipv4h->src_addr
 			);
-			for (; l3_payload_len >= 8; l3_payload_len -= 8)
-				csum = csum64_sub(*pos++, ~csum);
-			if (l3_payload_len > 0)
-				csum = csum64_sub(*pos & (0xFFFFFFFFFFFFFFFF >> (8 * l3_payload_len)), ~csum);
+			for (; pos != end; pos++)
+				csum = csum64_sub(*pos, ~csum);
+			if (l4_len % 8)
+				csum = csum64_sub(*pos & (0xFFFFFFFFFFFFFFFF >> (8 * (l4_len % 8))), ~csum);
 			tcph->cksum = ~csum32_sub_fold(csum64_sub_fold(csum));
 			#endif
 			#ifdef SUB32
 			uint32_t *pos = tcph;
+			uint32_t *end = pos + l4_len / sizeof(uint32_t);
 			uint32_t csum = csum32_sub(
-				(ipv4h->next_proto_id << 24) + rte_cpu_to_be_16(l3_payload_len),
+				(ipv4h->next_proto_id << 24) + rte_cpu_to_be_16(l4_len),
 				~csum32_sub(ipv4h->src_addr, ~ipv4h->dst_addr)
 			);
-			for (; l3_payload_len >= 4; l3_payload_len -= 4)
-				csum = csum32_sub(*pos++, ~csum);
-			if (l3_payload_len > 0)
-				csum = csum32_sub(*pos & (0xFFFFFFFF >> (8 * l3_payload_len)), ~csum);
+			for (; pos != end; pos++)
+				csum = csum32_sub(*pos, ~csum);
+			if (l4_len % 4)
+				csum = csum32_sub(*pos & (0xFFFFFFFF >> (8 * (l4_len % 4))), ~csum);
 			tcph->cksum = ~csum32_sub_fold(csum);
 			#endif
 			#ifdef SUB16
 			uint16_t *pos = tcph;
+			uint16_t *end = pos + l4_len / sizeof(uint16_t);
 			uint16_t csum = csum16_sub(
 				csum16_sub(ipv4h->src_addr >> 16, ~(ipv4h->src_addr & 0xFFFF)),
 				~csum16_sub(ipv4h->dst_addr >> 16, ~(ipv4h->dst_addr & 0xFFFF))
 			);
 			csum = csum16_sub(
-				csum16_sub(ipv4h->next_proto_id << 8, ~rte_cpu_to_be_16(l3_payload_len)),
+				csum16_sub(ipv4h->next_proto_id << 8, ~rte_cpu_to_be_16(l4_len)),
 				~csum
 			);
-			for (; l3_payload_len >= 2; l3_payload_len -= 2)
-				csum = csum16_sub(*pos++, ~csum);
-			if (l3_payload_len > 0)
+			for (; pos != end; pos++)
+				csum = csum16_sub(*pos, ~csum);
+			if (l4_len % 2)
 				csum = csum16_sub(*pos & 0xFF, ~csum);
 			tcph->cksum = ~csum;
 			#endif
-			timespec_get(&end, TIME_UTC);
+			timespec_get(&end_t, TIME_UTC);
 			
-			time = (end.tv_sec - start.tv_sec) * 1000000000
-						+ (end.tv_nsec - start.tv_nsec);
+			time = (end_t.tv_sec - start_t.tv_sec) * 1000000000
+						+ (end_t.tv_nsec - start_t.tv_nsec);
 			sum += time;
 
 			total_time += time;
@@ -324,7 +349,7 @@ lcore_main(void)
 			}
 		}
 
-		printf("ave[tatal = %d] = %ld\n", nb_rx, sum / nb_rx);
+		//printf("ave[tatal = %d] = %ld\n", nb_rx, sum / nb_rx);
 
 		/* Send burst of TX packets, to second port of pair. */
 		const uint16_t nb_tx = rte_eth_tx_burst(1, 0,
